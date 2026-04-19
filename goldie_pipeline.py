@@ -16,7 +16,7 @@ from datetime import datetime, timedelta
 import nltk
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 from dotenv import load_dotenv
-from fredapi import Fred  # nếu dùng fredapi
+from fredapi import Fred
 
 # Load API keys từ .env
 load_dotenv()
@@ -28,7 +28,7 @@ nltk.download('vader_lexicon')
 sia = SentimentIntensityAnalyzer()
 
 # ================================================
-# Ô 4: PIPELINE CHÍNH - CÀO, HUẤN LUYỆN, DỰ ĐOÁN, LƯU KẾT QUẢ
+# PIPELINE CHÍNH - CÀO, HUẤN LUYỆN, DỰ ĐOÁN, LƯU KẾT QUẢ
 # ================================================
 
 # --- Khai báo các hằng số ---
@@ -37,27 +37,32 @@ os.makedirs(DRIVE_FOLDER_PATH, exist_ok=True)
 MODEL_FILE_PATH = os.path.join(DRIVE_FOLDER_PATH, "gold_lstm_multivariate.h5")
 CHART_FILE_PATH = os.path.join(DRIVE_FOLDER_PATH, "latest_gold_forecast.png")
 
-# --- 1. Lấy dữ liệu giá vàng ---
+# --- 1. Lấy dữ liệu giá vàng (10 năm gần nhất) ---
 print("1. Lấy dữ liệu giá vàng...")
-df_gold = yf.Ticker("GLD").history(period="max")
+df_gold = yf.Ticker("GLD").history(period="10y") 
 df_gold = df_gold[['Close']].rename(columns={'Close': 'gold'})
 
-# --- 2. Lấy dữ liệu lãi suất FED (từ FRED) ---
-print("2. Lấy dữ liệu lãi suất FED...")
+# --- 2. Lấy dữ liệu lãi suất FED và Chỉ số sợ hãi VIX ---
+print("2. Lấy dữ liệu vĩ mô (FED Rate & VIX Index)...")
 fred = Fred(api_key=FRED_API_KEY)
-fed_rates = fred.get_series('DFF')  # Lấy tất cả
-fed_rates = fed_rates.resample('D').ffill()  # Nội suy sang hàng ngày
+fed_rates = fred.get_series('DFF')
+fed_rates = fed_rates.resample('D').ffill()
 fed_df = pd.DataFrame(fed_rates, columns=['fed_rate'])
 
-# --- 3. Lấy tin tức và tính sentiment hàng ngày ---
-print("3. Lấy tin tức và tính sentiment...")
+# Thêm chỉ số VIX để đo lường mức độ bất ổn thị trường
+vix_data = yf.Ticker("^VIX").history(period="10y")[['Close']].rename(columns={'Close': 'vix'})
+vix_data.index = vix_data.index.tz_localize(None)
+
+# --- 3. Cào tin tức địa chính trị và tính Sentiment ---
+print("3. Đang đánh giá mức độ lạc quan/căng thẳng thị trường...")
 end_date = pd.Timestamp.now().date()
-start_date = end_date - pd.Timedelta(days=30)  # lấy 30 ngày gần nhất
+start_date = end_date - pd.Timedelta(days=30) 
 
 def fetch_daily_sentiment(date):
     date_str = date.strftime('%Y-%m-%d')
-    query = f"Federal Reserve gold after:{date_str} before:{date_str}"
-    url = f"https://newsapi.org/v2/everything?q={query}&apiKey={NEWSAPI_KEY}&language=en&pageSize=10"
+    # Nâng cấp query: Quét cả tin tức FED và các biến động địa chính trị
+    query = "(Federal Reserve OR gold OR war OR conflict OR geopolitical) AND (gold OR economy)"
+    url = f"https://newsapi.org/v2/everything?q={query}&from={date_str}&to={date_str}&apiKey={NEWSAPI_KEY}&language=en&pageSize=15"
     try:
         response = requests.get(url, timeout=10)
         if response.status_code != 200:
@@ -67,9 +72,9 @@ def fetch_daily_sentiment(date):
             return 0
         scores = []
         for art in articles:
-            title = art.get('title', '')
-            if title:
-                scores.append(sia.polarity_scores(title)['compound'])
+            text_to_analyze = (art.get('title', '') + " " + art.get('description', '')).strip()
+            if text_to_analyze:
+                scores.append(sia.polarity_scores(text_to_analyze)['compound'])
         return np.mean(scores) if scores else 0
     except:
         return 0
@@ -79,23 +84,33 @@ sentiments = []
 for d in date_range:
     sent = fetch_daily_sentiment(d)
     sentiments.append(sent)
-    print(f"  {d.strftime('%Y-%m-%d')}: {sent:.2f}")
+    print(f"  {d.strftime('%Y-%m-%d')} Sentiment Score: {sent:.2f}")
 
 sentiment_df = pd.DataFrame({'date': date_range, 'sentiment': sentiments})
 sentiment_df.set_index('date', inplace=True)
 
-# --- 4. Ghép dữ liệu ---
-print("4. Ghép dữ liệu...")
-df = df_gold.join(fed_df, how='inner').join(sentiment_df, how='inner')
-df = df.dropna()
-print(f"Kết quả: {len(df)} ngày dữ liệu")
-print(df.tail())
+# --- 4. Ghép dữ liệu đa biến ---
+print("4. Ghép dữ liệu đa biến...")
+df_gold.index = df_gold.index.tz_localize(None) 
+df = df_gold.join(fed_df, how='left').join(vix_data, how='left').join(sentiment_df, how='left')
 
-# --- 5. Chuẩn bị dữ liệu cho LSTM ---
+# Xử lý dữ liệu thiếu bằng nội suy (Forward Fill)
+df['fed_rate'] = df['fed_rate'].ffill().fillna(0)
+df['vix'] = df['vix'].ffill().fillna(df['vix'].mean()) # VIX dùng trung bình nếu thiếu
+df['sentiment'] = df['sentiment'].fillna(0)
+df = df.dropna()
+
+print(f"Kết quả: {len(df)} ngày dữ liệu sẵn sàng (Features: {df.columns.tolist()})")
+
+# --- 5. Chuẩn bị dữ liệu cho LSTM (Chống Data Leakage) ---
 print("5. Chuẩn bị dữ liệu LSTM...")
-features = ['gold', 'fed_rate', 'sentiment']
+features = ['gold', 'fed_rate', 'vix', 'sentiment']
+split_idx = int(0.8 * len(df))
+train_df = df.iloc[:split_idx]
+
 scaler = MinMaxScaler()
-scaled_data = scaler.fit_transform(df[features])
+scaler.fit(train_df[features])
+scaled_data = scaler.transform(df[features])
 
 seq_len = 60
 X, y = [], []
@@ -104,13 +119,11 @@ for i in range(seq_len, len(scaled_data)):
     y.append(scaled_data[i, 0])
 
 X, y = np.array(X), np.array(y)
+X_train, X_test = X[:split_idx-seq_len], X[split_idx-seq_len:]
+y_train, y_test = y[:split_idx-seq_len], y[split_idx-seq_len:]
 
-split = int(0.8 * len(X))
-X_train, X_test = X[:split], X[split:]
-y_train, y_test = y[:split], y[split:]
-
-# --- 6. Huấn luyện mô hình ---
-print("6. Huấn luyện mô hình...")
+# --- 6. Huấn luyện mô hình đa biến ---
+print("6. Huấn luyện mô hình Goldie AI...")
 model = Sequential([
     LSTM(100, return_sequences=True, input_shape=(seq_len, len(features))),
     Dropout(0.2),
@@ -120,75 +133,71 @@ model = Sequential([
     Dense(1)
 ])
 model.compile(optimizer='adam', loss='mse')
-model.fit(X_train, y_train, batch_size=32, epochs=10, validation_data=(X_test, y_test), verbose=1)
+model.fit(X_train, y_train, batch_size=32, epochs=15, validation_data=(X_test, y_test), verbose=1)
 
 model.save(MODEL_FILE_PATH)
-print(f"Đã lưu mô hình vào {MODEL_FILE_PATH}")
 
 # --- 7. Dự đoán và đánh giá ---
 print("7. Dự đoán và vẽ biểu đồ...")
 predictions = model.predict(X_test)
-predictions = scaler.inverse_transform(
-    np.concatenate([predictions, np.zeros((len(predictions), len(features)-1))], axis=1)
-)[:,0]
+# Nghịch đảo scale để lấy giá USD thực
+pred_full = np.concatenate([predictions, np.zeros((len(predictions), len(features)-1))], axis=1)
+predictions = scaler.inverse_transform(pred_full)[:,0]
 
-y_test_real = scaler.inverse_transform(
-    np.concatenate([y_test.reshape(-1,1), np.zeros((len(y_test), len(features)-1))], axis=1)
-)[:,0]
+y_real_full = np.concatenate([y_test.reshape(-1,1), np.zeros((len(y_test), len(features)-1))], axis=1)
+y_test_real = scaler.inverse_transform(y_real_full)[:,0]
 
 mae = mean_absolute_error(y_test_real, predictions)
-rmse = np.sqrt(mean_squared_error(y_test_real, predictions))
-print(f"MAE: {mae:.2f}, RMSE: {rmse:.2f}")
+print(f"MAE (Sai số trung bình): {mae:.2f} USD")
 
 plt.figure(figsize=(16,8))
-plt.plot(y_test_real, label='Thực tế')
-plt.plot(predictions, label='Dự đoán')
-plt.title('Dự báo giá vàng - LSTM đa biến')
-plt.xlabel('Mẫu test')
-plt.ylabel('Giá vàng (USD)')
+plt.plot(y_test_real, label='Giá thực tế', color='blue')
+plt.plot(predictions, label='Goldie dự đoán', color='orange', linestyle='--')
+plt.title(f'Dự báo giá vàng (Features: Gold, FED, VIX, Sentiment) - MAE: {mae:.2f}')
 plt.legend()
 plt.savefig(CHART_FILE_PATH)
-print(f"Đã lưu biểu đồ vào {CHART_FILE_PATH}")
 
-# --- 8. Dự đoán ngày mai ---
+# --- 8. Dự đoán tương lai (Ngày mai) ---
 print("8. Dự đoán giá ngày mai...")
-last_60 = scaled_data[-seq_len:]  # lấy 60 ngày cuối
+last_60 = scaled_data[-seq_len:]
 X_future = np.array([last_60])
 pred_scaled = model.predict(X_future)[0][0]
-pred_array = np.zeros((1, len(features)))
-pred_array[0,0] = pred_scaled
-pred_price = scaler.inverse_transform(pred_array)[0,0]
+pred_price = scaler.inverse_transform([[pred_scaled, 0, 0, 0]])[0,0]
 real_last_price = df['gold'].iloc[-1]
-print(f"Giá hôm nay: {real_last_price:.2f} USD")
-print(f"Dự đoán ngày mai: {pred_price:.2f} USD")
 
-# --- 9. Lưu kết quả vào Google Sheet (tùy chọn) ---
-drive.mount('/content/drive')
-auth.authenticate_user()
+print(f"Giá hôm nay: {real_last_price:.2f} USD | Dự đoán ngày mai: {pred_price:.2f} USD")
+
+# --- 9. Đồng bộ Google Sheet ---
+print("9. Đang gửi báo cáo vào Google Sheet...")
 creds, _ = default()
 gc = gspread.authorize(creds)
 
 try:
-    sheet = gc.open("Goldie_Output").sheet1
-except:
-    print("Tạo sheet mới...")
-    sh = gc.create("Goldie_Output")
+    # Thử mở file cũ, nếu không thấy thì tạo mới
+    try:
+        sh = gc.open("Goldie_Output")
+    except:
+        print("Đang tạo file Google Sheet mới...")
+        sh = gc.create("Goldie_Output")
+        sh.share('', perm_type='anyone', role='writer')
+    
     sheet = sh.sheet1
-    sh.share('', perm_type='anyone', role='writer')
+    
+    # Dữ liệu cần ghi
+    update_data = [
+        ["Chỉ số", "Giá trị"],
+        ["Giá Hiện Tại", f"{real_last_price:.2f}"],
+        ["Dự Đoán Ngày Mai", f"{pred_price:.2f}"],
+        ["Cập nhật (VN)", (datetime.now() + timedelta(hours=7)).strftime('%Y-%m-%d %H:%M:%S')],
+        ["Sai số MAE", f"{mae:.2f}"],
+        ["Tâm lý thị trường", f"{df['sentiment'].iloc[-1]:.2f}"]
+    ]
+    
+    # CÁCH FIX: Xóa sạch sheet cũ rồi ghi đè dữ liệu mới cho chắc chắn
+    sheet.clear()
+    sheet.update(range_name='A1', values=update_data) # Chỉ định rõ range_name và values
 
-sheet.update_cell(1, 1, "Ký hiệu")
-sheet.update_cell(1, 2, "Giá trị")
-sheet.update_cell(2, 1, "Giá Hôm Nay")
-sheet.update_cell(2, 2, f"{real_last_price:.2f}")
-sheet.update_cell(3, 1, "Dự Đoán AI (Ngày mai)")
-sheet.update_cell(3, 2, f"{pred_price:.2f}")
-sheet.update_cell(4, 1, "Cập nhật lần cuối")
-sheet.update_cell(4, 2, pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S'))
-sheet.update_cell(5, 1, "MAE")
-sheet.update_cell(5, 2, f"{mae:.2f}")
-sheet.update_cell(6, 1, "RMSE")
-sheet.update_cell(6, 2, f"{rmse:.2f}")
-sheet.update_cell(7, 1, "Tên file Biểu đồ")
-sheet.update_cell(7, 2, "latest_gold_forecast.png")
+    print("✅ Pipeline hoàn tất! Kết quả đã nằm gọn trong Google Sheet.")
 
-print("✅ Hoàn tất pipeline! Kết quả đã được lưu vào Drive và Google Sheet.")
+except Exception as e:
+    print(f"❌ Lỗi ghi Sheet: {e}")

@@ -1,7 +1,42 @@
-.env
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
 *.h5
 *.png
 *.log
+.env
+
+%%writefile requirements.txt
+yfinance
+pandas
+numpy
+scikit-learn
+tensorflow
+matplotlib
+gspread
+google-auth
+python-dotenv
+nltk
+fredapi
+requests
+beautifulsoup4
+
+%%writefile .env.example
+FRED_API_KEY=your_fred_api_key_here
+NEWSAPI_KEY=your_newsapi_key_here
+
+%%writefile README.md
+# 🌟 Goldie AI: Time-Series Gold Price Predictor
+
+Dự án phát triển mô hình học sâu (LSTM) để dự báo biến động giá vàng dựa trên dữ liệu chuỗi thời gian (YFinance) và các chỉ số kinh tế vĩ mô (Lãi suất FED, Phân tích cảm xúc tin tức).
+
+## 🛠 Cài đặt môi trường
+1. Clone repository này về máy.
+2. Cài đặt thư viện: `pip install -r requirements.txt`
+3. Đổi tên file `.env.example` thành `.env` và nhập API key thật của bạn (FRED và NewsAPI).
+
+## 🚀 Cách chạy mô hình
+Chạy file script chính để thu thập dữ liệu, huấn luyện mô hình và xuất biểu đồ dự đoán:
+`python goldie_pipeline.py`
+
+*Kết quả dự đoán và biểu đồ sẽ được lưu tự động.*

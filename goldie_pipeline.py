@@ -39,7 +39,7 @@ CHART_FILE_PATH = os.path.join(DRIVE_FOLDER_PATH, "latest_gold_forecast.png")
 
 # --- 1. Lấy dữ liệu giá vàng (10 năm gần nhất) ---
 print("1. Lấy dữ liệu giá vàng...")
-df_gold = yf.Ticker("GLD").history(period="10y") 
+df_gold = yf.Ticker("GLD").history(period="10y")
 df_gold = df_gold[['Close']].rename(columns={'Close': 'gold'})
 
 # --- 2. Lấy dữ liệu lãi suất FED và Chỉ số sợ hãi VIX ---
@@ -56,7 +56,7 @@ vix_data.index = vix_data.index.tz_localize(None)
 # --- 3. Cào tin tức địa chính trị và tính Sentiment ---
 print("3. Đang đánh giá mức độ lạc quan/căng thẳng thị trường...")
 end_date = pd.Timestamp.now().date()
-start_date = end_date - pd.Timedelta(days=30) 
+start_date = end_date - pd.Timedelta(days=30)
 
 def fetch_daily_sentiment(date):
     date_str = date.strftime('%Y-%m-%d')
@@ -91,7 +91,7 @@ sentiment_df.set_index('date', inplace=True)
 
 # --- 4. Ghép dữ liệu đa biến ---
 print("4. Ghép dữ liệu đa biến...")
-df_gold.index = df_gold.index.tz_localize(None) 
+df_gold.index = df_gold.index.tz_localize(None)
 df = df_gold.join(fed_df, how='left').join(vix_data, how='left').join(sentiment_df, how='left')
 
 # Xử lý dữ liệu thiếu bằng nội suy (Forward Fill)
@@ -167,37 +167,48 @@ real_last_price = df['gold'].iloc[-1]
 
 print(f"Giá hôm nay: {real_last_price:.2f} USD | Dự đoán ngày mai: {pred_price:.2f} USD")
 
-# --- 9. Đồng bộ Google Sheet ---
-print("9. Đang gửi báo cáo vào Google Sheet...")
+# --- 9. Nhật ký dự đoán và Đối soát kết quả ---
+print("9. Đang cập nhật Nhật ký dự đoán vào Google Sheet...")
 creds, _ = default()
 gc = gspread.authorize(creds)
 
 try:
-    # Thử mở file cũ, nếu không thấy thì tạo mới
     try:
-        sh = gc.open("Goldie_Output")
+        sh = gc.open("Goldie_Log")
     except:
-        print("Đang tạo file Google Sheet mới...")
-        sh = gc.create("Goldie_Output")
+        sh = gc.create("Goldie_Log")
         sh.share('', perm_type='anyone', role='writer')
     
-    sheet = sh.sheet1
-    
-    # Dữ liệu cần ghi
-    update_data = [
-        ["Chỉ số", "Giá trị"],
-        ["Giá Hiện Tại", f"{real_last_price:.2f}"],
-        ["Dự Đoán Ngày Mai", f"{pred_price:.2f}"],
-        ["Cập nhật (VN)", (datetime.now() + timedelta(hours=7)).strftime('%Y-%m-%d %H:%M:%S')],
-        ["Sai số MAE", f"{mae:.2f}"],
-        ["Tâm lý thị trường", f"{df['sentiment'].iloc[-1]:.2f}"]
-    ]
-    
-    # CÁCH FIX: Xóa sạch sheet cũ rồi ghi đè dữ liệu mới cho chắc chắn
-    sheet.clear()
-    sheet.update(range_name='A1', values=update_data) # Chỉ định rõ range_name và values
+    # Dùng Sheet2 để làm Nhật ký (Log)
+    try:
+        log_sheet = sh.worksheet("Prediction_Log")
+    except:
+        log_sheet = sh.add_worksheet(title="Prediction_Log", rows="1000", cols="10")
+        log_sheet.append_row(["Ngày Dự Báo", "Giá Dự Báo", "Giá Thực Tế", "Chênh Lệch ($)", "Độ Chính Xác (%)"])
 
-    print("✅ Pipeline hoàn tất! Kết quả đã nằm gọn trong Google Sheet.")
+    # A. Cập nhật giá thực tế cho dự báo ngày hôm trước
+    all_data = log_sheet.get_all_values()
+    if len(all_data) > 1: # Nếu đã có dữ liệu
+        last_row_idx = len(all_data)
+        last_date_str = all_data[-1][0]
+        
+        # Nếu dòng cuối chưa có giá thực tế
+        if all_data[-1][2] == "":
+            diff = abs(real_last_price - float(all_data[-1][1]))
+            accuracy = max(0, 100 - (diff / real_last_price * 100))
+            
+            # Cập nhật vào dòng cuối
+            log_sheet.update_cell(last_row_idx, 3, f"{real_last_price:.2f}")
+            log_sheet.update_cell(last_row_idx, 4, f"{diff:.2f}")
+            log_sheet.update_cell(last_row_idx, 5, f"{accuracy:.2f}%")
+            print(f"Đã đối soát ngày {last_date_str}: Độ chính xác đạt {accuracy:.2f}%")
+
+    # B. Ghi dòng dự báo mới cho ngày mai
+    tomorrow = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
+    log_sheet.append_row([tomorrow, f"{pred_price:.2f}", "", "", ""])
+    
+    print(f"Đã lưu dự báo cho ngày {tomorrow}")
 
 except Exception as e:
-    print(f"❌ Lỗi ghi Sheet: {e}")
+    print(f"Lỗi Nhật ký: {e}")
+
